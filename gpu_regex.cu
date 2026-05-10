@@ -529,7 +529,14 @@ int main(void)
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     CUDA_CHECK(cudaEventElapsedTime(&ms_v1, t0, t1));
-
+    
+    // TEMP !!!
+    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    CUDA_CHECK(cudaMemcpy(h_results, d_results,
+                          num_packets * sizeof(MatchResult),
+                          cudaMemcpyDeviceToHost));
+    // TEMP !!!
+    
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_shared_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
@@ -538,10 +545,10 @@ int main(void)
     CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
 
     // ── 8. Copy results back Device → Host ──────────────────────
-    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
-    CUDA_CHECK(cudaMemcpy(h_results, d_results,
-                          num_packets * sizeof(MatchResult),
-                          cudaMemcpyDeviceToHost));
+    // MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    // CUDA_CHECK(cudaMemcpy(h_results, d_results,
+    //                       num_packets * sizeof(MatchResult),
+    //                       cudaMemcpyDeviceToHost));
 
     // ── 9. Summarize results ─────────────────────────────────────
     int total_alerts = 0;
