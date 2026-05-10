@@ -189,34 +189,38 @@ static void build_failure_and_complete(AhoCorasickDFA* ac)
 {
     std::queue<int> q;
 
-    /* ── TODO 2a — Handle root's direct children ──────────────────
-     * For each character c (0..255):
-     *   if go[0][c] == -1:
-     *     set go[0][c] = 0   (root self-loops on unknown chars)
-     *   else:
-     *     set fail[go[0][c]] = 0   (depth-1 states fail back to root)
-     *     push go[0][c] onto the queue
-     * ─────────────────────────────────────────────────────────── */
+    /* ── TODO 2a — Handle root's direct children ── */
 
-    /* ── TODO 2b — BFS: process every other state ─────────────────
-     * While the queue is not empty:
-     *   r = queue.front(); queue.pop();
-     *
-     *   // Merge output through failure link.
-     *   // If fail[r] matches pattern P, then r also matches P
-     *   // (since r's suffix is fail[r]'s full string).
-     *   ac->output[r] |= ac->output[ac->fail[r]];
-     *
-     *   For each character c (0..255):
-     *     if go[r][c] == -1:
-     *       // Missing transition: redirect via failure link
-     *       go[r][c] = go[fail[r]][c];
-     *     else:
-     *       // Existing child S: compute its failure link
-     *       int S = go[r][c];
-     *       fail[S] = go[fail[r]][c];
-     *       push S onto the queue
-     * ─────────────────────────────────────────────────────────── */
+    for (int c = 0; c < 256; c++) {
+        if(ac->go[0][c] == -1) {
+            ac->go[0][c] = 0;
+        }
+        else {
+            ac->fail[ac->go[0][c]] = 0;
+            q.push(ac->go[0][c]);
+        }
+    }
+
+    /* ── TODO 2b — BFS: process every other state ── */
+
+    while (!q.empty()) {
+        auto r = q.front();
+        q.pop();
+
+        // output merging
+        ac->output[r] |= ac->output[ac->fail[r]];
+
+        for (int c = 0; c < 256; c++) {
+            if(ac->go[r][c] == -1) {
+                ac->go[r][c] = ac->go[ac->fail[r]][c];
+            }
+            else {
+                int S = ac->go[r][c];
+                ac->fail[S] = ac->go[ac->fail[r]][c];
+                q.push(S);
+            }
+        } 
+    }
 }
 
 /* Public builder — calls both phases */
