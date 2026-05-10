@@ -1,7 +1,6 @@
 /*
  ============================================================
   ASSIGNMENT: GPU-Accelerated NIDS Pattern Matching
-  CUDA Learning Project
  ============================================================
 
   BACKGROUND:
@@ -136,24 +135,21 @@ static void build_goto_trie(AhoCorasickDFA* ac,
         for (int i = 0; patterns[p][i] != '\0'; i++) {
             int c = (unsigned char)patterns[p][i];
 
-            /* ── TODO 1a ──────────────────────────────────────────
-             * If go[state][c] == -1, no child exists for character c yet.
-             * Create a new state for it:
-             *   ac->go[state][c] = ac->num_states++;
-             *
-             * Then advance: state = ac->go[state][c]
-             *
-             * Hint: after creating states, check if num_states >= MAX_STATES
-             * and print an error + exit if so.
-             * ──────────────────────────────────────────────────── */
+            /* ── TODO 1a ──*/
+
+            if (ac->go[state][c] == -1) {
+                ac->go[state][c] = ac->num_states++;
+
+                if (ac->num_states >= MAX_STATES) {
+                    fprintf(stderr, "ERROR: MAX_STATES (%d) exceeded. Increase it.\n", MAX_STATES);
+                    exit(1);
+                }
+            }
+            state = ac->go[state][c];
         }
 
-        /* ── TODO 1b ──────────────────────────────────────────────
-         * Mark the final state of this pattern as an accepting state.
-         * Use a BITMASK: set bit p in ac->output[state].
-         *
-         * Hint: ac->output[state] |= (1u << p);
-         * ──────────────────────────────────────────────────────── */
+        /* ── TODO 1b ── */
+        ac->output[state] |= (1u << p);
     }
 }
 
