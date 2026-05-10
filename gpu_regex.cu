@@ -297,6 +297,8 @@ __global__ void scan_packets_kernel(
          * This is the "hot" line — executed once per byte per packet.
          * All threads execute it simultaneously (SIMT model).
          * ────────────────────────────────────────────────────── */
+        
+        state = dfa->go[state][c];
 
         /* ── TODO 3b ────────────────────────────────────────────
          * Check if any pattern matches at this position.
@@ -309,6 +311,12 @@ __global__ void scan_packets_kernel(
          *     Hint: __popc(x) is the GPU popcount (count set bits) intrinsic
          *   - OR the new matches into `matched`
          * ────────────────────────────────────────────────────── */
+        if (dfa->output[state] != 0) {
+            if (first_pos == -1) first_pos = i;
+            int new_matches = dfa->output[state] & ~matched;
+            match_count += __popc(new_matches);
+            matched |= new_matches;
+        } 
     }
 
     /* ── Write this thread's results to global memory ── */
