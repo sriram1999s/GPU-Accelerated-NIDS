@@ -289,31 +289,14 @@ __global__ void scan_packets_kernel(
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)pkt[i];
 
-        /* ── TODO 3a ────────────────────────────────────────────
-         * Follow the DFA transition for character c.
-         * This is a single line:
-         *   state = dfa->go[state][c];
-         *
-         * This is the "hot" line — executed once per byte per packet.
-         * All threads execute it simultaneously (SIMT model).
-         * ────────────────────────────────────────────────────── */
+        /* ── TODO 3a ── */
         
         state = dfa->go[state][c];
 
-        /* ── TODO 3b ────────────────────────────────────────────
-         * Check if any pattern matches at this position.
-         * dfa->output[state] is a bitmask: bit i set = pattern i matches.
-         *
-         * If output[state] != 0:
-         *   - record first_pos if not set yet
-         *   - count NEW matches (patterns not already in `matched`)
-         *     Hint: new_matches = output[state] & ~matched;
-         *     Hint: __popc(x) is the GPU popcount (count set bits) intrinsic
-         *   - OR the new matches into `matched`
-         * ────────────────────────────────────────────────────── */
+        /* ── TODO 3b ── */
         if (dfa->output[state] != 0) {
             if (first_pos == -1) first_pos = i;
-            int new_matches = dfa->output[state] & ~matched;
+            uint32_t new_matches = dfa->output[state] & ~matched;
             match_count += __popc(new_matches);
             matched |= new_matches;
         } 
