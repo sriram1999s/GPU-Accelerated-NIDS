@@ -505,24 +505,8 @@ int main(void)
 
     // ── 6. Launch the kernel ─────────────────────────────────────
 
-    /* ── TODO 4a — Calculate grid size ───────────────────────────
-     *
-     * We want exactly one thread per packet.
-     * Blocks have THREADS_PER_BLOCK threads each.
-     * We need enough blocks to cover all packets:
-     *
-     *   grid_size = ceil(num_packets / THREADS_PER_BLOCK)
-     *
-     * In integer arithmetic (no floats needed):
-     *   grid_size = (num_packets + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-     *
-     * Why the + THREADS_PER_BLOCK - 1?
-     *   It rounds up instead of down. E.g. 100000 / 256 = 390.6...
-     *   Without rounding: 390 blocks × 256 = 99840 threads (misses 160 packets!)
-     *   With rounding:    391 blocks × 256 = 100096 threads (the kernel's
-     *   bounds check  if (tid >= num_packets)  handles the extra threads.)
-     * ─────────────────────────────────────────────────────────── */
-    int grid_size = 0; // replace with your calculation
+    /* ── TODO 4a — Calculate grid size ── */
+    int grid_size = (num_packets + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     printf("[GPU] Grid: %d blocks × %d threads\n", grid_size, THREADS_PER_BLOCK);
 
@@ -536,22 +520,22 @@ int main(void)
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
 
-    /* ── TODO 4b — Time Kernel v1 ────────────────────────────────
-     * Use cudaEventRecord / cudaEventSynchronize / cudaEventElapsedTime
-     * to measure how long the kernel takes.
-     *
-     * Pattern:
-     *   cudaEventRecord(t0);
-     *   kernel<<<...>>>(...);
-     *   cudaEventRecord(t1);
-     *   cudaEventSynchronize(t1);        // wait for GPU to finish
-     *   float ms;
-     *   cudaEventElapsedTime(&ms, t0, t1);
-     *
-     * Do this for both scan_packets_kernel and scan_packets_shared_kernel.
-     * ─────────────────────────────────────────────────────────── */
+    /* ── TODO 4b — Time Kernel v1 ── */
     float ms_v1 = 0, ms_v2 = 0;
-    // ... your timing code here ...
+    // timing code
+    CUDA_CHECK(cudaEventRecord(t0));
+    scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v1, t0, t1));
+
+    CUDA_CHECK(cudaEventRecord(t0));
+    scan_packets_shared_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
 
     // ── 8. Copy results back Device → Host ──────────────────────
     MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
