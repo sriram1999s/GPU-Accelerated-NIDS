@@ -123,7 +123,53 @@ int main(void)
     CUDA_CHECK(cudaMemcpy(d_offsets, h_offsets, num_packets * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_lengths, h_lengths, num_packets * sizeof(int), cudaMemcpyHostToDevice));
 
-    // ── 6. Launch the kernel ─────────────────────────────────────
+    // ── 6. Texture object setup for go[][] ─────────────────────────
+    /*
+    * Steps:
+    *   1. Allocate a CUDA array (2D, optimized for texture access)
+    *   2. Copy go[][] into it
+    *   3. Create a resource descriptor pointing at the array
+    *   4. Create a texture descriptor (how to sample it)
+    *   5. Create the texture object
+    */
+
+    // Step 6.1 — allocate 2D CUDA array: MAX_STATES rows × ALPHABET_SIZE cols of int
+    cudaArray_t cu_go_array;
+    cudaChannelFormatDesc channel_desc = cudaCreateChannelDesc<int>();
+    CUDA_CHECK(cudaMallocArray(&cu_go_array, &channel_desc,
+                                ALPHABET_SIZE,   // width  = columns = 256
+                                MAX_STATES));    // height = rows    = 512
+
+    // Step 6.2 — copy go[][] row by row into the CUDA array
+    CUDA_CHECK(cudaMemcpy2DToArray(
+        cu_go_array,
+        0, 0,                                        // x, y offset
+        h_dfa->go,                                   // source
+        ALPHABET_SIZE * sizeof(int),                 // source pitch (bytes per row)
+        ALPHABET_SIZE * sizeof(int),                 // width to copy
+        MAX_STATES,                                  // height to copy
+        cudaMemcpyHostToDevice));
+
+    // Step 6.3 — resource descriptor
+    struct cudaResourceDesc res_desc;
+    memset(&res_desc, 0, sizeof(res_desc));
+    res_desc.resType         = cudaResourceTypeArray;
+    res_desc.res.array.array = cu_go_array;
+
+    // Step 6.4 — texture descriptor
+    struct cudaTextureDesc tex_desc;
+    memset(&tex_desc, 0, sizeof(tex_desc));
+    tex_desc.addressMode[0] = cudaAddressModeClamp;  // x (columns)
+    tex_desc.addressMode[1] = cudaAddressModeClamp;  // y (rows)
+    tex_desc.filterMode     = cudaFilterModePoint;   // no interpolation (we want exact ints)
+    tex_desc.readMode       = cudaReadModeElementType;
+    tex_desc.normalizedCoords = 0;                   // use raw integer coordinates
+
+    // Step 6.6 — create texture object
+    cudaTextureObject_t tex_go = 0;
+    CUDA_CHECK(cudaCreateTextureObject(&tex_go, &res_desc, &tex_desc, NULL));
+
+    // ── 7. Launch the kernel ─────────────────────────────────────
 
     /* ── TODO 4a — Calculate grid size ── */
     int grid_size = (num_packets + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -135,13 +181,13 @@ int main(void)
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // ── 7. Timed runs ────────────────────────────────────────────
+    // ── 8. Timed runs ────────────────────────────────────────────
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
 
     /* ── TODO 4b — Time Kernel v1 ── */
-    float ms_v1 = 0, ms_v2 = 0;
+    float ms_v1 = 0, ms_v2 = 0, ms_v3 = 0;
     // timing code
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
@@ -164,13 +210,20 @@ int main(void)
     CUDA_CHECK(cudaEventSynchronize(t1));
     CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
 
-    // ── 8. Copy results back Device → Host ──────────────────────
+    CUDA_CHECK(cudaEventRecord(t0));
+    scan_packets_texture_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        tex_go, d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v3, t0, t1));
+
+    // ── 9. Copy results back Device → Host ──────────────────────
     MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
     CUDA_CHECK(cudaMemcpy(h_results, d_results,
                           num_packets * sizeof(MatchResult),
                           cudaMemcpyDeviceToHost));
 
-    // ── 9. Summarize results ─────────────────────────────────────
+    // ── 10. Summarize results ─────────────────────────────────────
     int total_alerts = 0;
     int pattern_hits[MAX_PATTERNS] = {0};
 
@@ -185,21 +238,22 @@ int main(void)
 
     double gbps_v1 = (actual_bytes * 8.0) / (ms_v1 * 1.0e6);
     double gbps_v2 = (actual_bytes * 8.0) / (ms_v2 * 1.0e6);
+    double gbps_v3 = (actual_bytes * 8.0) / (ms_v3 * 1.0e6);
 
     printf("\n── Results ──────────────────────────────────\n");
     printf("  Packets scanned   : %d\n", num_packets);
     printf("  Packets alerted   : %d  (%.1f%%)\n",
            total_alerts, 100.0 * total_alerts / num_packets);
     printf("\n── Performance ──────────────────────────────\n");
-    printf("  Kernel v1 (global mem) : %6.2f ms  → %.1f Gbps\n", ms_v1, gbps_v1);
-    printf("  Kernel v2 (shared mem) : %6.2f ms  → %.1f Gbps\n", ms_v2, gbps_v2);
-    printf("  Shared mem speedup     : %.2fx\n", ms_v1 / ms_v2);
+    printf("  v1 global mem          : %6.2f ms  → %6.1f Gbps\n", ms_v1, gbps_v1);
+    printf("  v2 + shared output[]   : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v2, gbps_v2, ms_v1/ms_v2);
+    printf("  v3 + texture go[][]    : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v3, gbps_v3, ms_v1/ms_v3);
 
     printf("\n── Per-Signature Hits ───────────────────────\n");
     for (int p = 0; p < num_patterns; p++)
         printf("  [%d] %-28s : %d\n", p, patterns[p], pattern_hits[p]);
 
-    // ── 10. Correctness check ────────────────────────────────────
+    // ── 11. Correctness check ────────────────────────────────────
     printf("\n── Correctness vs CPU (first 2000 packets) ──\n");
     int errors = 0;
     for (int i = 0; i < 2000 && i < num_packets; i++) {
@@ -213,12 +267,14 @@ int main(void)
     }
     printf(errors == 0 ? "  All match ✓\n" : "  %d errors\n", errors);
 
-    // ── 11. Cleanup ──────────────────────────────────────────────
+    // ── 12. Cleanup ──────────────────────────────────────────────
     free(h_dfa); free(h_packets); free(h_offsets);
     free(h_lengths); free(h_results);
     cudaFree(d_dfa); cudaFree(d_packets); cudaFree(d_offsets);
     cudaFree(d_lengths); cudaFree(d_results);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
+    cudaDestroyTextureObject(tex_go);
+    cudaFreeArray(cu_go_array);
 
     printf("\n[Done]\n");
     return 0;

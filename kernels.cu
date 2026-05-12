@@ -143,3 +143,55 @@ __global__ void scan_packets_shared_kernel(
     results[tid].match_count      = match_count;
     results[tid].first_match_pos  = first_pos;
 }
+
+// ============================================================
+// GPU KERNEL v3 — Texture Memory Optimization
+// ============================================================
+__global__ void scan_packets_texture_kernel(
+    cudaTextureObject_t                tex_go,
+    const AhoCorasickDFA* __restrict__ dfa,
+    const char*           __restrict__ packets,
+    const int*            __restrict__ offsets,
+    const int*            __restrict__ lengths,
+    MatchResult*                       results,
+    int                                num_packets)
+{
+    __shared__ uint32_t s_output[MAX_STATES];
+
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    int lane = threadIdx.x;
+
+    for (int i = lane; i < dfa->num_states; i += blockDim.x) {
+        s_output[i] = dfa->output[i];
+    }
+
+    // barrier synchronization
+    __syncthreads();
+
+    if (tid >= num_packets) return;
+
+    const char* pkt = packets + offsets[tid];
+    int         len = lengths[tid];
+
+    int      state       = 0;
+    uint32_t matched     = 0;
+    int      match_count = 0;
+    int      first_pos   = -1;
+
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)pkt[i];
+        state = tex2D<int>(tex_go, c, state);
+
+        /* ── TODO 5c ── */
+        if (s_output[state] != 0) {
+            if (first_pos == -1) first_pos = i;
+            uint32_t new_matches = s_output[state] & ~matched;
+            match_count += __popc(new_matches);
+            matched |= new_matches;
+        } 
+    }
+
+    results[tid].matched_patterns = matched;
+    results[tid].match_count      = match_count;
+    results[tid].first_match_pos  = first_pos;
+}
