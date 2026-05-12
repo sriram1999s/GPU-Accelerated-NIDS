@@ -335,24 +335,20 @@ __global__ void scan_packets_shared_kernel(
     MatchResult*                       results,
     int                                num_packets)
 {
-    /* ── TODO 5a — Declare shared memory ────────────────────────
-     * __shared__ uint32_t s_output[MAX_STATES];
-     * ────────────────────────────────────────────────────────── */
+    /* ── TODO 5a — Declare shared memory ── */
+
+    __shared__ uint32_t s_output[MAX_STATES];
 
     int tid  = blockIdx.x * blockDim.x + threadIdx.x;
     int lane = threadIdx.x;   // This thread's index within its block (0..blockDim.x-1)
 
-    /* ── TODO 5b — Cooperatively load output[] into shared memory
-     *
-     * We have blockDim.x threads but MAX_STATES elements to load.
-     * Use a strided loop so every element gets loaded:
-     *
-     *   for (int i = lane; i < dfa->num_states; i += blockDim.x)
-     *       s_output[i] = dfa->output[i];
-     *
-     * Then call __syncthreads() to ensure ALL threads have finished
-     * loading before anyone starts reading s_output[].
-     * ────────────────────────────────────────────────────────── */
+    /* ── TODO 5b — Cooperatively load output[] into shared memory ── */
+
+    for (int i=lane; i < dfa->num_states; i += blockDim.x) {
+        s_output[i] = dfa->output[i];
+    }
+
+    __syncthreads();
 
     if (tid >= num_packets) return;
 
@@ -368,11 +364,13 @@ __global__ void scan_packets_shared_kernel(
         unsigned char c = (unsigned char)pkt[i];
         state = dfa->go[state][c];
 
-        /* ── TODO 5c ─────────────────────────────────────────────
-         * Same match-check logic as TODO 3b, BUT:
-         * Read from s_output[state] instead of dfa->output[state].
-         * This is the payoff for all the shared memory setup above.
-         * ────────────────────────────────────────────────────── */
+        /* ── TODO 5c ── */
+        if (s_output[state] != 0) {
+            if (first_pos == -1) first_pos = i;
+            uint32_t new_matches = s_output[state] & ~matched;
+            match_count += __popc(new_matches);
+            matched |= new_matches;
+        } 
     }
 
     results[tid].matched_patterns = matched;
@@ -531,12 +529,12 @@ int main(void)
     CUDA_CHECK(cudaEventElapsedTime(&ms_v1, t0, t1));
     
     // TEMP !!!
-    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
-    CUDA_CHECK(cudaMemcpy(h_results, d_results,
-                          num_packets * sizeof(MatchResult),
-                          cudaMemcpyDeviceToHost));
+    // MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    // CUDA_CHECK(cudaMemcpy(h_results, d_results,
+    //                       num_packets * sizeof(MatchResult),
+    //                       cudaMemcpyDeviceToHost));
     // TEMP !!!
-    
+
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_shared_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
@@ -545,10 +543,10 @@ int main(void)
     CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
 
     // ── 8. Copy results back Device → Host ──────────────────────
-    // MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
-    // CUDA_CHECK(cudaMemcpy(h_results, d_results,
-    //                       num_packets * sizeof(MatchResult),
-    //                       cudaMemcpyDeviceToHost));
+    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    CUDA_CHECK(cudaMemcpy(h_results, d_results,
+                          num_packets * sizeof(MatchResult),
+                          cudaMemcpyDeviceToHost));
 
     // ── 9. Summarize results ─────────────────────────────────────
     int total_alerts = 0;
