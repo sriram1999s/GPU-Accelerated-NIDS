@@ -18,9 +18,6 @@
 NVCC       := nvcc
 TARGET     := gpu_nids
 
-# -arch=sm_XX : match your GPU's compute capability
-#   RTX 30xx / A100 = sm_86, RTX 20xx = sm_75, GTX 10xx = sm_61
-# Use -arch=native to auto-detect (CUDA ≥ 11.6)
 ARCH       := -arch=sm_75
 
 NVCCFLAGS  := $(ARCH)          \
@@ -41,24 +38,24 @@ PROFILEFLAGS := $(ARCH)        \
               -lineinfo         \
               --use_fast_math
 
-SRC        := gpu_regex.cu
+SRCS := main.cu kernels.cu aho_corasick.cu
 
 # ── Default target ───────────────────────────────────────────
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
+$(TARGET): $(SRCS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $(SRCS)
 	@echo "Built: $(TARGET)"
 
 # ── Debug build ──────────────────────────────────────────────
-debug: $(SRC)
-	$(NVCC) $(DEBUGFLAGS) -o $(TARGET)_debug $<
+debug: $(SRCS)
+	$(NVCC) $(DEBUGFLAGS) -o $(TARGET)_debug $(SRCS)
 	@echo "Debug build: $(TARGET)_debug"
 	@echo "Run with:  cuda-memcheck ./$(TARGET)_debug"
 
 # ── Profile build ────────────────────────────────────────────
-profile: $(SRC)
-	$(NVCC) $(PROFILEFLAGS) -o $(TARGET)_profile $<
+profile: $(SRCS)
+	$(NVCC) $(PROFILEFLAGS) -o $(TARGET)_profile $(SRCS)
 	@echo "Profile build: $(TARGET)_profile"
 	@echo "Run with:  nv-nsight-cu-cli ./$(TARGET)_profile"
 	@echo "       or: nvprof ./$(TARGET)_profile"

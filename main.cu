@@ -1,0 +1,225 @@
+#include "nids.h"
+
+// ============================================================
+// CPU: REFERENCE SCANNER (already implemented — use to verify GPU)
+// ============================================================
+/*
+ * Runs the same DFA logic on the CPU.
+ * After your GPU kernel is working, compare its output to this.
+ * Any mismatch means a bug in your kernel or DFA construction.
+ */
+MatchResult cpu_scan_one_packet(const AhoCorasickDFA* ac,
+                                        const char*           pkt,
+                                        int                   len)
+{
+    MatchResult result = {0, 0, -1};
+    int state = 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)pkt[i];
+        state = ac->go[state][c];
+        uint32_t out = ac->output[state];
+        if (out) {
+            if (result.first_match_pos == -1) result.first_match_pos = i;
+            uint32_t new_m = out & ~result.matched_patterns;
+            result.match_count += __builtin_popcount(new_m);
+            result.matched_patterns |= out;
+        }
+    }
+    return result;
+}
+
+// ============================================================
+// CPU: SYNTHETIC PACKET GENERATOR (already implemented)
+// ============================================================
+/*
+ * Fills packet_buf with num_packets random payloads.
+ * ~10% of packets have a pattern injected at a random offset.
+ * Returns total bytes written.
+ */
+size_t generate_packets(char*        packet_buf,
+                                int*         offsets,
+                                int*         lengths,
+                                int          num_packets,
+                                const char** patterns,
+                                int          num_patterns)
+{
+    srand(12345);
+    size_t cursor = 0;
+    for (int i = 0; i < num_packets; i++) {
+        offsets[i] = (int)cursor;
+        int len = 64 + rand() % (MAX_PACKET_LEN - 63);
+        lengths[i] = len;
+        for (int j = 0; j < len; j++)
+            packet_buf[cursor + j] = (char)(32 + rand() % 95);
+        if (rand() % 10 == 0 && num_patterns > 0) {
+            int p       = rand() % num_patterns;
+            int pat_len = (int)strlen(patterns[p]);
+            if (pat_len < len) {
+                int pos = rand() % (len - pat_len);
+                memcpy(packet_buf + cursor + pos, patterns[p], pat_len);
+            }
+        }
+        cursor += len;
+    }
+    return cursor;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+int main(void)
+{
+    printf("=========================================\n");
+    printf("  GPU-Accelerated NIDS Pattern Matcher   \n");
+    printf("=========================================\n\n");
+
+    // ── 1. Patterns (Snort-style attack signatures) ─────────────
+    const char* patterns[] = {
+        "User-Agent: Nmap",
+        "SELECT * FROM",
+        "/etc/passwd",
+        "cmd.exe",
+        "<script>",
+        "UNION SELECT",
+        "../../../",
+        "eval(base64_decode",
+    };
+    int num_patterns = (int)(sizeof(patterns) / sizeof(patterns[0]));
+
+    // ── 2. Build DFA on CPU ──────────────────────────────────────
+    AhoCorasickDFA* h_dfa = (AhoCorasickDFA*)malloc(sizeof(AhoCorasickDFA));
+    build_aho_corasick(h_dfa, patterns, num_patterns);
+
+    // ── 3. Generate test packets ─────────────────────────────────
+    int    num_packets   = 100000;
+    size_t buf_capacity  = (size_t)num_packets * MAX_PACKET_LEN;
+
+    char* h_packets = (char*)malloc(buf_capacity);
+    int*  h_offsets = (int* )malloc(num_packets * sizeof(int));
+    int*  h_lengths = (int* )malloc(num_packets * sizeof(int));
+
+    printf("[CPU] Generating %d packets...\n", num_packets);
+    size_t actual_bytes = generate_packets(
+        h_packets, h_offsets, h_lengths,
+        num_packets, patterns, num_patterns);
+    printf("[CPU] Total payload: %.2f MB\n\n", actual_bytes / 1.0e6);
+
+    // ── 4. Allocate GPU memory ───────────────────────────────────
+    AhoCorasickDFA* d_dfa;
+    char*           d_packets;
+    int*            d_offsets;
+    int*            d_lengths;
+    MatchResult*    d_results;
+
+    CUDA_CHECK(cudaMalloc(&d_dfa,     sizeof(AhoCorasickDFA)));
+    CUDA_CHECK(cudaMalloc(&d_packets, actual_bytes));
+    CUDA_CHECK(cudaMalloc(&d_offsets, num_packets * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_lengths, num_packets * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_results, num_packets * sizeof(MatchResult)));
+
+    // ── 5. Copy data Host → Device ───────────────────────────────
+    CUDA_CHECK(cudaMemcpy(d_dfa,     h_dfa,     sizeof(AhoCorasickDFA),   cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_packets, h_packets, actual_bytes,              cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_offsets, h_offsets, num_packets * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_lengths, h_lengths, num_packets * sizeof(int), cudaMemcpyHostToDevice));
+
+    // ── 6. Launch the kernel ─────────────────────────────────────
+
+    /* ── TODO 4a — Calculate grid size ── */
+    int grid_size = (num_packets + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    printf("[GPU] Grid: %d blocks × %d threads\n", grid_size, THREADS_PER_BLOCK);
+
+    // Warm-up run (first kernel launch has driver overhead)
+    scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ── 7. Timed runs ────────────────────────────────────────────
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+
+    /* ── TODO 4b — Time Kernel v1 ── */
+    float ms_v1 = 0, ms_v2 = 0;
+    // timing code
+    CUDA_CHECK(cudaEventRecord(t0));
+    scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v1, t0, t1));
+    
+    // TEMP !!!
+    // MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    // CUDA_CHECK(cudaMemcpy(h_results, d_results,
+    //                       num_packets * sizeof(MatchResult),
+    //                       cudaMemcpyDeviceToHost));
+    // TEMP !!!
+
+    CUDA_CHECK(cudaEventRecord(t0));
+    scan_packets_shared_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
+        d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
+
+    // ── 8. Copy results back Device → Host ──────────────────────
+    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    CUDA_CHECK(cudaMemcpy(h_results, d_results,
+                          num_packets * sizeof(MatchResult),
+                          cudaMemcpyDeviceToHost));
+
+    // ── 9. Summarize results ─────────────────────────────────────
+    int total_alerts = 0;
+    int pattern_hits[MAX_PATTERNS] = {0};
+
+    for (int i = 0; i < num_packets; i++) {
+        if (h_results[i].matched_patterns) {
+            total_alerts++;
+            for (int p = 0; p < num_patterns; p++)
+                if (h_results[i].matched_patterns & (1u << p))
+                    pattern_hits[p]++;
+        }
+    }
+
+    double gbps_v1 = (actual_bytes * 8.0) / (ms_v1 * 1.0e6);
+    double gbps_v2 = (actual_bytes * 8.0) / (ms_v2 * 1.0e6);
+
+    printf("\n── Results ──────────────────────────────────\n");
+    printf("  Packets scanned   : %d\n", num_packets);
+    printf("  Packets alerted   : %d  (%.1f%%)\n",
+           total_alerts, 100.0 * total_alerts / num_packets);
+    printf("\n── Performance ──────────────────────────────\n");
+    printf("  Kernel v1 (global mem) : %6.2f ms  → %.1f Gbps\n", ms_v1, gbps_v1);
+    printf("  Kernel v2 (shared mem) : %6.2f ms  → %.1f Gbps\n", ms_v2, gbps_v2);
+    printf("  Shared mem speedup     : %.2fx\n", ms_v1 / ms_v2);
+
+    printf("\n── Per-Signature Hits ───────────────────────\n");
+    for (int p = 0; p < num_patterns; p++)
+        printf("  [%d] %-28s : %d\n", p, patterns[p], pattern_hits[p]);
+
+    // ── 10. Correctness check ────────────────────────────────────
+    printf("\n── Correctness vs CPU (first 2000 packets) ──\n");
+    int errors = 0;
+    for (int i = 0; i < 2000 && i < num_packets; i++) {
+        MatchResult cpu_r = cpu_scan_one_packet(
+            h_dfa, h_packets + h_offsets[i], h_lengths[i]);
+        if (cpu_r.matched_patterns != h_results[i].matched_patterns) {
+            printf("  MISMATCH packet %d: CPU=0x%08X GPU=0x%08X\n",
+                   i, cpu_r.matched_patterns, h_results[i].matched_patterns);
+            if (++errors > 5) { printf("  (stopped after 5)\n"); break; }
+        }
+    }
+    printf(errors == 0 ? "  All match ✓\n" : "  %d errors\n", errors);
+
+    // ── 11. Cleanup ──────────────────────────────────────────────
+    free(h_dfa); free(h_packets); free(h_offsets);
+    free(h_lengths); free(h_results);
+    cudaFree(d_dfa); cudaFree(d_packets); cudaFree(d_offsets);
+    cudaFree(d_lengths); cudaFree(d_results);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    printf("\n[Done]\n");
+    return 0;
+}
