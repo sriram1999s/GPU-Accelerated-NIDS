@@ -1,13 +1,9 @@
+
 #include "nids.h"
 
 // ============================================================
 // CPU: REFERENCE SCANNER (already implemented — use to verify GPU)
 // ============================================================
-/*
- * Runs the same DFA logic on the CPU.
- * After your GPU kernel is working, compare its output to this.
- * Any mismatch means a bug in your kernel or DFA construction.
- */
 MatchResult cpu_scan_one_packet(const AhoCorasickDFA* ac,
                                         const char*           pkt,
                                         int                   len)
@@ -31,11 +27,6 @@ MatchResult cpu_scan_one_packet(const AhoCorasickDFA* ac,
 // ============================================================
 // CPU: SYNTHETIC PACKET GENERATOR (already implemented)
 // ============================================================
-/*
- * Fills packet_buf with num_packets random payloads.
- * ~10% of packets have a pattern injected at a random offset.
- * Returns total bytes written.
- */
 size_t generate_packets(char*        packet_buf,
                                 int*         offsets,
                                 int*         lengths,
@@ -94,9 +85,15 @@ int main(void)
     int    num_packets   = 100000;
     size_t buf_capacity  = (size_t)num_packets * MAX_PACKET_LEN;
 
-    char* h_packets = (char*)malloc(buf_capacity);
-    int*  h_offsets = (int* )malloc(num_packets * sizeof(int));
-    int*  h_lengths = (int* )malloc(num_packets * sizeof(int));
+    // Pinned memory — required for async cudaMemcpyAsync in streams
+    char*        h_packets;
+    int*         h_offsets;
+    int*         h_lengths;
+    MatchResult* h_results;
+    CUDA_CHECK(cudaMallocHost(&h_packets, buf_capacity));
+    CUDA_CHECK(cudaMallocHost(&h_offsets, num_packets * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&h_lengths, num_packets * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&h_results, num_packets * sizeof(MatchResult)));
 
     printf("[CPU] Generating %d packets...\n", num_packets);
     size_t actual_bytes = generate_packets(
@@ -124,59 +121,40 @@ int main(void)
     CUDA_CHECK(cudaMemcpy(d_lengths, h_lengths, num_packets * sizeof(int), cudaMemcpyHostToDevice));
 
     // ── 6. Texture object setup for go[][] ─────────────────────────
-    /*
-    * Steps:
-    *   1. Allocate a CUDA array (2D, optimized for texture access)
-    *   2. Copy go[][] into it
-    *   3. Create a resource descriptor pointing at the array
-    *   4. Create a texture descriptor (how to sample it)
-    *   5. Create the texture object
-    */
-
-    // Step 6.1 — allocate 2D CUDA array: MAX_STATES rows × ALPHABET_SIZE cols of int
     cudaArray_t cu_go_array;
     cudaChannelFormatDesc channel_desc = cudaCreateChannelDesc<int>();
-    CUDA_CHECK(cudaMallocArray(&cu_go_array, &channel_desc,
-                                ALPHABET_SIZE,   // width  = columns = 256
-                                MAX_STATES));    // height = rows    = 512
+    CUDA_CHECK(cudaMallocArray(&cu_go_array, &channel_desc, ALPHABET_SIZE, MAX_STATES));
 
-    // Step 6.2 — copy go[][] row by row into the CUDA array
     CUDA_CHECK(cudaMemcpy2DToArray(
-        cu_go_array,
-        0, 0,                                        // x, y offset
-        h_dfa->go,                                   // source
-        ALPHABET_SIZE * sizeof(int),                 // source pitch (bytes per row)
-        ALPHABET_SIZE * sizeof(int),                 // width to copy
-        MAX_STATES,                                  // height to copy
+        cu_go_array, 0, 0,
+        h_dfa->go,
+        ALPHABET_SIZE * sizeof(int),
+        ALPHABET_SIZE * sizeof(int),
+        MAX_STATES,
         cudaMemcpyHostToDevice));
 
-    // Step 6.3 — resource descriptor
     struct cudaResourceDesc res_desc;
     memset(&res_desc, 0, sizeof(res_desc));
     res_desc.resType         = cudaResourceTypeArray;
     res_desc.res.array.array = cu_go_array;
 
-    // Step 6.4 — texture descriptor
     struct cudaTextureDesc tex_desc;
     memset(&tex_desc, 0, sizeof(tex_desc));
-    tex_desc.addressMode[0] = cudaAddressModeClamp;  // x (columns)
-    tex_desc.addressMode[1] = cudaAddressModeClamp;  // y (rows)
-    tex_desc.filterMode     = cudaFilterModePoint;   // no interpolation (we want exact ints)
-    tex_desc.readMode       = cudaReadModeElementType;
-    tex_desc.normalizedCoords = 0;                   // use raw integer coordinates
+    tex_desc.addressMode[0]   = cudaAddressModeClamp;
+    tex_desc.addressMode[1]   = cudaAddressModeClamp;
+    tex_desc.filterMode       = cudaFilterModePoint;
+    tex_desc.readMode         = cudaReadModeElementType;
+    tex_desc.normalizedCoords = 0;
 
-    // Step 6.6 — create texture object
     cudaTextureObject_t tex_go = 0;
     CUDA_CHECK(cudaCreateTextureObject(&tex_go, &res_desc, &tex_desc, NULL));
 
     // ── 7. Launch the kernel ─────────────────────────────────────
-
-    /* ── TODO 4a — Calculate grid size ── */
     int grid_size = (num_packets + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     printf("[GPU] Grid: %d blocks × %d threads\n", grid_size, THREADS_PER_BLOCK);
 
-    // Warm-up run (first kernel launch has driver overhead)
+    // Warm-up run
     scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -186,23 +164,22 @@ int main(void)
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
 
-    /* ── TODO 4b — Time Kernel v1 ── */
-    float ms_v1 = 0, ms_v2 = 0, ms_v3 = 0;
-    // timing code
+    // Create streams
+    cudaStream_t streams[NUM_STREAMS];
+    for (int s = 0; s < NUM_STREAMS; s++)
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+
+    float ms_v1 = 0, ms_v2 = 0, ms_v3 = 0, ms_v4 = 0;
+
+    // v1 — global memory
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     CUDA_CHECK(cudaEventElapsedTime(&ms_v1, t0, t1));
-    
-    // TEMP !!!
-    // MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
-    // CUDA_CHECK(cudaMemcpy(h_results, d_results,
-    //                       num_packets * sizeof(MatchResult),
-    //                       cudaMemcpyDeviceToHost));
-    // TEMP !!!
 
+    // v2 — shared memory
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_shared_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
@@ -210,6 +187,7 @@ int main(void)
     CUDA_CHECK(cudaEventSynchronize(t1));
     CUDA_CHECK(cudaEventElapsedTime(&ms_v2, t0, t1));
 
+    // v3 — texture memory
     CUDA_CHECK(cudaEventRecord(t0));
     scan_packets_texture_kernel<<<grid_size, THREADS_PER_BLOCK>>>(
         tex_go, d_dfa, d_packets, d_offsets, d_lengths, d_results, num_packets);
@@ -217,8 +195,52 @@ int main(void)
     CUDA_CHECK(cudaEventSynchronize(t1));
     CUDA_CHECK(cudaEventElapsedTime(&ms_v3, t0, t1));
 
-    // ── 9. Copy results back Device → Host ──────────────────────
-    MatchResult* h_results = (MatchResult*)malloc(num_packets * sizeof(MatchResult));
+    // v4 — shared memory + streams
+    int batch = (num_packets + NUM_STREAMS - 1) / NUM_STREAMS;
+
+    CUDA_CHECK(cudaEventRecord(t0));
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        int start = s * batch;
+        int count = min(batch, num_packets - start);
+        if (count <= 0) break;
+
+        int grid = (count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        // compute byte range for this batch
+        int byte_start = h_offsets[start];
+        int byte_end   = h_offsets[start + count - 1] + h_lengths[start + count - 1];
+        int byte_count = byte_end - byte_start;
+
+        CUDA_CHECK(cudaMemcpyAsync(d_packets + byte_start,
+                                   h_packets + byte_start,
+                                   byte_count,
+                                   cudaMemcpyHostToDevice, streams[s]));
+        CUDA_CHECK(cudaMemcpyAsync(d_offsets + start,
+                                   h_offsets + start,
+                                   count * sizeof(int),
+                                   cudaMemcpyHostToDevice, streams[s]));
+        CUDA_CHECK(cudaMemcpyAsync(d_lengths + start,
+                                   h_lengths + start,
+                                   count * sizeof(int),
+                                   cudaMemcpyHostToDevice, streams[s]));
+
+        scan_packets_shared_kernel<<<grid, THREADS_PER_BLOCK, 0, streams[s]>>>(
+            d_dfa, d_packets, d_offsets + start, d_lengths + start,
+            d_results + start, count);
+
+        CUDA_CHECK(cudaMemcpyAsync(h_results + start,
+                                   d_results + start,
+                                   count * sizeof(MatchResult),
+                                   cudaMemcpyDeviceToHost, streams[s]));
+    }
+    for (int s = 0; s < NUM_STREAMS; s++)
+        CUDA_CHECK(cudaStreamSynchronize(streams[s]));
+
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms_v4, t0, t1));
+
+    // ── 9. Copy results back Device → Host (for v1/v2/v3 correctness) ──
     CUDA_CHECK(cudaMemcpy(h_results, d_results,
                           num_packets * sizeof(MatchResult),
                           cudaMemcpyDeviceToHost));
@@ -239,15 +261,17 @@ int main(void)
     double gbps_v1 = (actual_bytes * 8.0) / (ms_v1 * 1.0e6);
     double gbps_v2 = (actual_bytes * 8.0) / (ms_v2 * 1.0e6);
     double gbps_v3 = (actual_bytes * 8.0) / (ms_v3 * 1.0e6);
+    double gbps_v4 = (actual_bytes * 8.0) / (ms_v4 * 1.0e6);
 
     printf("\n── Results ──────────────────────────────────\n");
     printf("  Packets scanned   : %d\n", num_packets);
     printf("  Packets alerted   : %d  (%.1f%%)\n",
            total_alerts, 100.0 * total_alerts / num_packets);
     printf("\n── Performance ──────────────────────────────\n");
-    printf("  v1 global mem          : %6.2f ms  → %6.1f Gbps\n", ms_v1, gbps_v1);
-    printf("  v2 + shared output[]   : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v2, gbps_v2, ms_v1/ms_v2);
-    printf("  v3 + texture go[][]    : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v3, gbps_v3, ms_v1/ms_v3);
+    printf("  v1 global mem          : %6.2f ms  → %6.1f Gbps\n",           ms_v1, gbps_v1);
+    printf("  v2 shared output[]     : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v2, gbps_v2, ms_v1/ms_v2);
+    printf("  v3 texture go[][]      : %6.2f ms  → %6.1f Gbps  (%.2fx v1)\n", ms_v3, gbps_v3, ms_v1/ms_v3);
+    printf("  v4 shared + streams    : %6.2f ms  → %6.1f Gbps  (%.2fx v2)\n", ms_v4, gbps_v4, ms_v2/ms_v4);
 
     printf("\n── Per-Signature Hits ───────────────────────\n");
     for (int p = 0; p < num_patterns; p++)
@@ -268,8 +292,15 @@ int main(void)
     printf(errors == 0 ? "  All match ✓\n" : "  %d errors\n", errors);
 
     // ── 12. Cleanup ──────────────────────────────────────────────
-    free(h_dfa); free(h_packets); free(h_offsets);
-    free(h_lengths); free(h_results);
+    for (int s = 0; s < NUM_STREAMS; s++)
+        CUDA_CHECK(cudaStreamDestroy(streams[s]));
+
+    free(h_dfa);
+    cudaFreeHost(h_packets);
+    cudaFreeHost(h_offsets);
+    cudaFreeHost(h_lengths);
+    cudaFreeHost(h_results);
+
     cudaFree(d_dfa); cudaFree(d_packets); cudaFree(d_offsets);
     cudaFree(d_lengths); cudaFree(d_results);
     cudaEventDestroy(t0); cudaEventDestroy(t1);

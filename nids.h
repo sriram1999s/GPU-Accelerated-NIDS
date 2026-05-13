@@ -14,7 +14,7 @@
 #define MAX_PATTERNS       32
 #define MAX_PACKET_LEN   1500
 #define THREADS_PER_BLOCK 256
-
+#define NUM_STREAMS 4
 // ============================================================
 // CUDA ERROR-CHECKING MACRO
 // ============================================================
