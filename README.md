@@ -1,6 +1,6 @@
 # GPU-Accelerated NIDS Pattern Matching
 
-A CUDA implementation of the Aho-Corasick multi-pattern matching algorithm for network intrusion detection. Scans 100,000 network packets against 8 attack signatures simultaneously, achieving ~40 Gbps throughput on a single GPU.
+A CUDA implementation of the Aho-Corasick multi-pattern matching algorithm for network intrusion detection. Scans 100,000 network packets against 8 attack signatures simultaneously, achieving ~84 Gbps throughput on a single GPU.
 
 ## Background
 
@@ -35,34 +35,60 @@ UNION SELECT           — SQL UNION attack
 eval(base64_decode     — PHP webshell payload
 ```
 
-## Results
+## Results (GTX 1650 Ti, sm_75)
 
 ```
 Packets scanned  : 100,000
-Packets alerted  : ~9,952  (10%)
+Packets alerted  : 9,952  (10%)
 DFA states       : 94
-Kernel v1        : 15.88 ms  →  39.4 Gbps  (global memory)
-Kernel v2        : in progress              (shared memory)
 Correctness      : All match ✓  (verified against CPU reference)
+
+v1 global mem       : 15.79 ms  →  39.6 Gbps  (baseline)
+v2 shared output[]  :  7.43 ms  →  84.2 Gbps  (2.12x v1) ← best
+v3 texture go[][]   : 19.24 ms  →  32.5 Gbps  (0.82x v1) ← slower
+v4 shared + streams : 14.35 ms  →  43.6 Gbps  (0.52x v2) ← slower
 ```
+
+## Optimization Notes
+
+**v2 — shared memory for `output[]` (+2.12x)**
+The `output[]` array (2 KB) fits in shared memory. All 256 threads in a block
+cooperatively load it once, then read it at ~5 cycle latency instead of ~200 cycle
+global memory latency. This is the only optimization that meaningfully improved throughput.
+
+**v3 — texture memory for `go[][]` (-0.82x)**
+Texture memory is designed for 2D spatially local access. In theory `go[state][c]`
+should benefit since threads scanning similar packets walk similar DFA paths. In
+practice, the GTX 1650 Ti's texture cache is too small — the 512×256 transition
+table (512 KB) thrashes it. Result: slower than the baseline.
+
+**v4 — CUDA streams (-0.52x vs v2)**
+Streams overlap H→D memcpy with kernel execution to hide transfer latency. This
+benchmark uploads all data upfront before the timed runs, so by the time v4 executes,
+the data is already on the GPU — streams add re-upload overhead with no benefit. In a
+real NIDS processing a continuous feed of fresh packets, streams would show their advantage.
+
+The real bottleneck throughout is `go[state][c]` — a 512 KB table accessed with a
+random pattern (different threads are at different states). This is non-coalesced
+global memory access and cannot be fully optimized without restructuring the algorithm.
 
 ## Implementation
 
 ```
-gpu_regex.cu
-├── AhoCorasickDFA               — transition table, failure links, output bitmasks
-├── build_goto_trie()            — CPU phase 1: insert patterns into trie
-├── build_failure_and_complete() — CPU phase 2: BFS failure links + DFA completion
-├── scan_packets_kernel          — GPU kernel v1: one thread per packet, global memory
-├── scan_packets_shared_kernel   — GPU kernel v2: shared memory output[] cache
-├── cpu_scan_one_packet()        — CPU reference implementation for correctness checks
-└── main()                       — orchestration, timing, results
+nids.h           — shared structs, macros, defines, function declarations
+aho_corasick.cu  — CPU DFA construction (build_goto_trie, build_failure_and_complete)
+kernels.cu       — all four GPU kernels
+main.cu          — orchestration, timing, correctness check
+Makefile         — build system
 ```
 
 **Key CUDA concepts used:**
 - Grid / block / thread indexing
 - Global memory allocation and host-device transfers
 - Shared memory cooperative loading with `__syncthreads()`
+- Texture memory objects (`cudaTextureObject_t`, `tex2D`)
+- CUDA streams and `cudaMemcpyAsync`
+- Pinned (page-locked) memory with `cudaMallocHost`
 - CUDA events for kernel timing
 - `__popc()` hardware popcount intrinsic
 - Bitmask encoding for multi-pattern match results
